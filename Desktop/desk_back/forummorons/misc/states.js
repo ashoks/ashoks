@@ -1,416 +1,290 @@
-(function ($) {
-
-/**
- * The base States namespace.
- *
- * Having the local states variable allows us to use the States namespace
- * without having to always declare "Drupal.states".
- */
-var states = Drupal.states = {
-  // An array of functions that should be postponed.
-  postponed: []
-};
-
-/**
- * Attaches the states.
- */
-Drupal.behaviors.states = {
-  attach: function (context, settings) {
-    for (var selector in settings.states) {
-      for (var state in settings.states[selector]) {
-        new states.Dependent({
-          element: $(selector),
-          state: states.State.sanitize(state),
-          dependees: settings.states[selector][state]
-        });
-      }
-    }
-
-    // Execute all postponed functions now.
-    while (states.postponed.length) {
-      (states.postponed.shift())();
-    }
-  }
-};
-
-/**
- * Object representing an element that depends on other elements.
- *
- * @param args
- *   Object with the following keys (all of which are required):
- *   - element: A jQuery object of the dependent element
- *   - state: A State object describing the state that is dependent
- *   - dependees: An object with dependency specifications. Lists all elements
- *     that this element depends on.
- */
-states.Dependent = function (args) {
-  $.extend(this, { values: {}, oldValue: undefined }, args);
-
-  for (var selector in this.dependees) {
-    this.initializeDependee(selector, this.dependees[selector]);
-  }
-};
-
-/**
- * Comparison functions for comparing the value of an element with the
- * specification from the dependency settings. If the object type can't be
- * found in this list, the === operator is used by default.
- */
-states.Dependent.comparisons = {
-  'RegExp': function (reference, value) {
-    return reference.test(value);
-  },
-  'Function': function (reference, value) {
-    // The "reference" variable is a comparison function.
-    return reference(value);
-  }
-};
-
-states.Dependent.prototype = {
-  /**
-   * Initializes one of the elements this dependent depends on.
-   *
-   * @param selector
-   *   The CSS selector describing the dependee.
-   * @param dependeeStates
-   *   The list of states that have to be monitored for tracking the
-   *   dependee's compliance status.
-   */
-  initializeDependee: function (selector, dependeeStates) {
-    var self = this;
-
-    // Cache for the states of this dependee.
-    self.values[selector] = {};
-
-    $.each(dependeeStates, function (state, value) {
-      state = states.State.sanitize(state);
-
-      // Initialize the value of this state.
-      self.values[selector][state.pristine] = undefined;
-
-      // Monitor state changes of the specified state for this dependee.
-      $(selector).bind('state:' + state, function (e) {
-        var complies = self.compare(value, e.value);
-        self.update(selector, state, complies);
-      });
-
-      // Make sure the event we just bound ourselves to is actually fired.
-      new states.Trigger({ selector: selector, state: state });
-    });
-  },
-
-  /**
-   * Compares a value with a reference value.
-   *
-   * @param reference
-   *   The value used for reference.
-   * @param value
-   *   The value to compare with the reference value.
-   * @return
-   *   true, undefined or false.
-   */
-  compare: function (reference, value) {
-    if (reference.constructor.name in states.Dependent.comparisons) {
-      // Use a custom compare function for certain reference value types.
-      return states.Dependent.comparisons[reference.constructor.name](reference, value);
-    }
-    else {
-      // Do a plain comparison otherwise.
-      return compare(reference, value);
-    }
-  },
-
-  /**
-   * Update the value of a dependee's state.
-   *
-   * @param selector
-   *   CSS selector describing the dependee.
-   * @param state
-   *   A State object describing the dependee's updated state.
-   * @param value
-   *   The new value for the dependee's updated state.
-   */
-  update: function (selector, state, value) {
-    // Only act when the 'new' value is actually new.
-    if (value !== this.values[selector][state.pristine]) {
-      this.values[selector][state.pristine] = value;
-      this.reevaluate();
-    }
-  },
-
-  /**
-   * Triggers change events in case a state changed.
-   */
-  reevaluate: function () {
-    var value = undefined;
-
-    // Merge all individual values to find out whether this dependee complies.
-    for (var selector in this.values) {
-      for (var state in this.values[selector]) {
-        state = states.State.sanitize(state);
-        var complies = this.values[selector][state.pristine];
-        value = ternary(value, invert(complies, state.invert));
-      }
-    }
-
-    // Only invoke a state change event when the value actually changed.
-    if (value !== this.oldValue) {
-      // Store the new value so that we can compare later whether the value
-      // actually changed.
-      this.oldValue = value;
-
-      // Normalize the value to match the normalized state name.
-      value = invert(value, this.state.invert);
-
-      // By adding "trigger: true", we ensure that state changes don't go into
-      // infinite loops.
-      this.element.trigger({ type: 'state:' + this.state, value: value, trigger: true });
-    }
-  }
-};
-
-states.Trigger = function (args) {
-  $.extend(this, args);
-
-  if (this.state in states.Trigger.states) {
-    this.element = $(this.selector);
-
-    // Only call the trigger initializer when it wasn't yet attached to this
-    // element. Otherwise we'd end up with duplicate events.
-    if (!this.element.data('trigger:' + this.state)) {
-      this.initialize();
-    }
-  }
-};
-
-states.Trigger.prototype = {
-  initialize: function () {
-    var self = this;
-    var trigger = states.Trigger.states[this.state];
-
-    if (typeof trigger == 'function') {
-      // We have a custom trigger initialization function.
-      trigger.call(window, this.element);
-    }
-    else {
-      $.each(trigger, function (event, valueFn) {
-        self.defaultTrigger(event, valueFn);
-      });
-    }
-
-    // Mark this trigger as initialized for this element.
-    this.element.data('trigger:' + this.state, true);
-  },
-
-  defaultTrigger: function (event, valueFn) {
-    var self = this;
-    var oldValue = valueFn.call(this.element);
-
-    // Attach the event callback.
-    this.element.bind(event, function (e) {
-      var value = valueFn.call(self.element, e);
-      // Only trigger the event if the value has actually changed.
-      if (oldValue !== value) {
-        self.element.trigger({ type: 'state:' + self.state, value: value, oldValue: oldValue });
-        oldValue = value;
-      }
-    });
-
-    states.postponed.push(function () {
-      // Trigger the event once for initialization purposes.
-      self.element.trigger({ type: 'state:' + self.state, value: oldValue, oldValue: undefined });
-    });
-  }
-};
-
-/**
- * This list of states contains functions that are used to monitor the state
- * of an element. Whenever an element depends on the state of another element,
- * one of these trigger functions is added to the dependee so that the
- * dependent element can be updated.
- */
-states.Trigger.states = {
-  // 'empty' describes the state to be monitored
-  empty: {
-    // 'keyup' is the (native DOM) event that we watch for.
-    'keyup': function () {
-      // The function associated to that trigger returns the new value for the
-      // state.
-      return this.val() == '';
-    }
-  },
-
-  checked: {
-    'change': function () {
-      return this.attr('checked');
-    }
-  },
-
-  // For radio buttons, only return the value if the radio button is selected.
-  value: {
-    'keyup': function () {
-      // Radio buttons share the same :input[name="key"] selector.
-      if (this.length > 1) {
-        // Initial checked value of radios is undefined, so we return false.
-        return this.filter(':checked').val() || false;
-      }
-      return this.val();
-    },
-    'change': function () {
-      // Radio buttons share the same :input[name="key"] selector.
-      if (this.length > 1) {
-        // Initial checked value of radios is undefined, so we return false.
-        return this.filter(':checked').val() || false;
-      }
-      return this.val();
-    }
-  },
-
-  collapsed: {
-    'collapsed': function(e) {
-      return (e !== undefined && 'value' in e) ? e.value : this.is('.collapsed');
-    }
-  }
-};
+Resume
 
 
-/**
- * A state object is used for describing the state and performing aliasing.
- */
-states.State = function(state) {
-  // We may need the original unresolved name later.
-  this.pristine = this.name = state;
+S. Ashok,
+     Sri Krishna Complex,
+Ltd 24 NGR Road, Chennai,
+   Chennai – 600028.
+E-mail:sivakumarashok@hotmail.com						:  +91  9514820965
 
-  // Normalize the state name.
-  while (true) {
-    // Iteratively remove exclamation marks and invert the value.
-    while (this.name.charAt(0) == '!') {
-      this.name = this.name.substring(1);
-      this.invert = !this.invert;
-    }
 
-    // Replace the state with its normalized name.
-    if (this.name in states.State.aliases) {
-      this.name = states.State.aliases[this.name];
-    }
-    else {
-      break;
-    }
-  }
-};
+OBJECTIVE:
 
-/**
- * Create a new State object by sanitizing the passed value.
- */
-states.State.sanitize = function (state) {
-  if (state instanceof states.State) {
-    return state;
-  }
-  else {
-    return new states.State(state);
-  }
-};
+A challenging career that will enable me to exhibit my professional competency to the zenith and will enable me to expose my talent to the maximum, to reach the heights of success.
 
-/**
- * This list of aliases is used to normalize states and associates negated names
- * with their respective inverse state.
- */
-states.State.aliases = {
-  'enabled': '!disabled',
-  'invisible': '!visible',
-  'invalid': '!valid',
-  'untouched': '!touched',
-  'optional': '!required',
-  'filled': '!empty',
-  'unchecked': '!checked',
-  'irrelevant': '!relevant',
-  'expanded': '!collapsed',
-  'readwrite': '!readonly'
-};
+PROFESSIONAL SUMMARY:
 
-states.State.prototype = {
-  invert: false,
+Software professional with 10 years & 5 months of experience in software development.  Proficient in Web application development.
 
-  /**
-   * Ensures that just using the state object returns the name.
-   */
-  toString: function() {
-    return this.name;
-  }
-};
+High proficiency in PHP 5.x, PHP 7.x, PHP 8.x Drupal 10.x, Drupal 9.x Drupal 8.x,  Drupal 7.x,  Codeigniter,  AJAX, MySQL,  Webservices.
 
-/**
- * Global state change handlers. These are bound to "document" to cover all
- * elements whose state changes. Events sent to elements within the page
- * bubble up to these handlers. We use this system so that themes and modules
- * can override these state change handlers for particular parts of a page.
- */
-{
-  $(document).bind('state:disabled', function(e) {
-    // Only act when this change was triggered by a dependency and not by the
-    // element monitoring itself.
-    if (e.trigger) {
-      $(e.target)
-        .attr('disabled', e.value)
-        .filter('.form-element')
-          .closest('.form-item, .form-submit, .form-wrapper')[e.value ? 'addClass' : 'removeClass']('form-disabled');
+Medium proficiency in Wordpress, Cakephp, Laravel,  JQUERY, JAVASCRIPT, HTML, CSS Bootstrap.
 
-      // Note: WebKit nightlies don't reflect that change correctly.
-      // See https://bugs.webkit.org/show_bug.cgi?id=23789
-    }
-  });
+I have experience with Git version control, Agile development methodologies, as well as cloud platforms such as AWS and Azure.
 
-  $(document).bind('state:required', function(e) {
-    if (e.trigger) {
-      if (e.value) {
-        $(e.target).closest('.form-item, .form-wrapper').find('label').append('<span class="form-required">*</span>');
-      }
-      else {
-        $(e.target).closest('.form-item, .form-wrapper').find('label .form-required').remove();
-      }
-    }
-  });
 
-  $(document).bind('state:visible', function(e) {
-    if (e.trigger) {
-      $(e.target).closest('.form-item, .form-submit, .form-wrapper')[e.value ? 'show' : 'hide']();
-    }
-  });
+Excellent analytical, Programming skills and ability to work well in a team environment.
 
-  $(document).bind('state:checked', function(e) {
-    if (e.trigger) {
-      $(e.target).attr('checked', e.value);
-    }
-  });
+PROFESSIONAL EXPERIENCE:
 
-  $(document).bind('state:collapsed', function(e) {
-    if (e.trigger) {
-      if ($(e.target).is('.collapsed') !== e.value) {
-        $('> legend a', e.target).click();
-      }
-    }
-  });
-}
 
-/**
- * These are helper functions implementing addition "operators" and don't
- * implement any logic that is particular to states.
- */
-{
-  // Bitwise AND with a third undefined state.
-  function ternary (a, b) {
-    return a === undefined ? b : (b === undefined ? a : a && b);
-  };
+								      From:  24-Feb-2023  to 30-June-2025
 
-  // Inverts a (if it's not undefined) when invert is true.
-  function invert (a, invert) {
-    return (invert && a !== undefined) ? !a : a;
-  };
+Present  Employer 7            -        Stratsol Software Systems Pvt. Ltd
 
-  // Compares two values while ignoring undefined values.
-  function compare (a, b) {
-    return (a === b) ? (a === undefined ? a : true) : (a === undefined || b === undefined);
-  }
-}
+Role			    -        Senior Software Engineer
 
-})(jQuery);
+Project – 1
+Project Title:		   -    prism.capgemini.com
+Description:		   -    Prism offers to Capgemini diverse range of knowledge,                     connecting all aspects of the business. It’s an internal port for Capgemini.
+
+Role				1. Involved in migration from Drupal 7 to Drupal 9
+                                                               and Drupal 9 to Drupal 10 CMS.
+                                                          2. Bug fixing 
+3. Customization in custom and contributed modules.
+4. DAST and SAST scan report issue fixing.
+5. Involved in a new enhancement.
+
+
+
+
+
+								      From:  03-Aug-2022  to 01-Dec-2022
+
+Previous Employer 6            -        iKomet Technology Solutions Pvt. Ltd
+
+Role			    -        Software Engineer
+
+
+Project – 1
+Project Title:		   -    investorsbank.com
+Description:		   -    To help our customers, colleagues and communities reach their
+Potential.
+Role				1. Planning and requirement Analysis.
+                                              2. Involved in integrating Drupal 9 CMS.
+3. Customization in custom and contributed modules.
+4. Written API for investorsbank portal supports
+
+Language & Database:		Drupal  9.x& MySQL 5.x.
+
+
+
+								      From:  Oct/2021 to 02-Aug-2022
+
+Previous Employer 5            -        Innoppl IT Services Pvt. Ltd
+
+Role			    -        Software Programmer
+Project -1
+
+Project Title:		   -    composers.com
+Language & Database:	            Drupal  8.x& MySQL 5.x.
+   -     
+
+Project -2
+
+Project Title:		   -    hplubricants.in
+Language & Database:	            Drupal  7.x& MySQL 5.x.
+						
+
+
+								      From:  Dec/2020 to 20-Oct-2021
+
+Previous Employer 4             -       Smitiv Mobile Technologies Pte Ltd
+
+Role			     -    Senior Associate Software Engineer
+
+Project – 1
+Project Title		:      www.sistic.com.sg
+
+Description		:    SISTIC is Singapore’s largest ticketing agency and one of the countries
+leading e-commerce players, selling over 6 million tickets to-date. A 
+pioneer in the industry, we manage an extensive portfolio of major events
+each year. We put customers first and are committed to creating a one-
+stop marketplace dedicated to the arts, culture and entertainment sectors.
+              .	
+
+Role			:	1. Planning and requirement Analysis.
+                                              2. Involved in integrating Drupal 8 CMS.
+3. Customization in custom and contributed modules.
+4. Written API for sistic portal supports
+
+
+
+Language & Database:		Drupal  8.x& MySQL 5.x.
+
+
+
+
+								      From:  July/2020 to Oct/2020
+
+Previous Employer 3             -       Staffice Global
+
+Role			     -       Senior Software Engineer
+
+Project – 1
+Project Title		:     fsstech.com
+
+Description	:   FSS is a strategic payments partner for leading global banks, financial  
+                                      Institutions, processors, central regulators, and governments across North  
+                                      America, UK, Europe, Middle East, Africa, and APAC and has 2,500 domain 
+                                      Specialists on-board. For more information visit www.fsstech.com
+.
+              .	
+
+Role			:	1. Planning and requirement Analysis.
+                                              2. Involved in integrating Drupal 8 CMS.
+3. Customization in custom and contributed modules.
+4. Designing the Screen through custom theme integration.
+
+Language & Database:		Drupal  8.x& MySQL 5.x.
+
+
+
+Project Title		:      fssomnix.com
+
+Description		:    It's informative website for fss. This website provide details with many
+                                        Pages about company services
+              .	
+Role			:	1. Planning and requirement Analysis.
+                                              2. Involved in integrating WordPress CMS.
+3. Required WordPress Plugin integration.
+4. Designing the Screen through custom theme integration.
+
+Language & Database:		WordPress 5.x & MySQL 5.x.
+
+
+							
+
+								      From:  Sep/2018 to Feb/2020
+
+Previous Employer 3	-             Indus Net Technologies
+
+
+
+Role			-             Software Engineer
+
+
+
+
+Project – 1
+Project Title		:   	vit.ac.in
+
+Description		:	VIT created for Vellore Engineering College.  The site visitors can get   
+the information about institution and University such as  
+academics, admissions, placements, events, international relations 
+research, campus life,academic staff college, etc. All pages are very  
+user friendly and get a more attractive front end design look. The site
+authenticated user can access privileges based pages updates. The  
+site super admin can control all things.
+	
+Role			:	1. Planning and requirement Analysis
+                                              2. Involved in integrating Drupal  7 CMS.
+3. Customization in custom and contributed modules.
+4. Designing the Screen through enable custom theme.
+
+
+
+Language & Database:		drupal 7.x & MySQL 5.x.
+
+Project – 2
+Project Title		:   	sundaramfinance.in
+
+Description		:	Sundaram Finance Limited is a financial and investment service 
+provider in India. It is based in Chennai. The pages on this website 
+contains such details as Vehicle loan, construction equipment loan,  
+consumer loans, wealth management, commercial finance, and 
+infrastructure finance, among others.	
+
+Role			:	1. Planning and requirement Analysis.
+                                              2. Involved in integrating Drupal 8 CMS.
+3. Customization in custom and contributed modules.
+4. Designing the Screen through enable custom theme.
+
+Language & Database:		drupal 8.x & MySQL 5.x.
+
+
+
+
+
+									From: Dec/2014  to  Aug/2018
+
+Previous Employer 1	-	Valviinfotech (Chennai)
+
+Role			-	Web Application Developer
+
+
+Project - 1
+
+Project Title		:   	jerseycoastrealty.com
+
+Description		:	This websites to know shore rentals. The site offers a variety of 
+                                              Summer rentals in Cape May, wildwood crest etc. Which can help user
+can narrow your choices (eg., number of bedrooms, number of blocks 
+to the beach, if pets are permitted).The website also offers 
+information on homes for sale at the Jersey Shore, Hotels and motels, 
+as well as links to restaurants, attractions and events.
+				
+				 In this I worked with,
+1. Developed admin module for the site.
+Role		:		2.Involved in Analysis, Coding and DB Design                                                          
+3. Function, Views, through MySQL 5.x
+4. Designing the Screen through HTML & CSS,  ThenJquery.
+
+Language & Database:		PHP 5.x & MySQL 5.x.
+
+Project - 2
+
+Project Title		:   	Lcmrschooldistrict.com 
+
+Description		:	Lcmrschooldistrict.com is an online portal designed for the Lower Cape  
+                                             May Regional School Staffs and Students. This site having three types 
+                                             Of users as Admin, District Admin and Participant. The participants will 
+			           Be allowed for registering the classes. District admin will be allowed to     
+Manage the classes. Admin can add, manage the classes and the users      etc. Forum section is integrated to communicate with the users
+
+
+Role			:	1. Involved in Analysis, Coding and DB Design
+2.  Developed admin module for the site
+3.Code testing.
+4. Designing the Screen through HTML & CSS, Then JQuery.
+Language & Database	:	PHP 5.x,  Ajax, JQuery  & MySQL 5.x
+
+
+Below the Other projects URL list
+
+https://www.simplecpr.com/
+https://schools.devims.com
+https://www.artandculture.tn.gov.in
+https://serc.res.in
+https://www.csircmc.res.in
+https://maksansolutions.com
+http://www.tnhorticulture.tn.gov.in
+https://vit.ac.in
+https://keystonetech.com
+										
+EDUCATION DETAILS:
+
+M.Sc in IT (2008) from Bharathidasan University with 66% marks.
+
+B.Sc in IT (2006) from Bharathidasan University with 58% marks.
+
+PERSONAL INFORMATION:
+
+1.	Name			-	S. Ashok
+
+2.	Languages    		-	English, Tamil
+
+3.	Marital Status		-	Married
+
+4.	Gender			-	Male
+
+5.	Permanent Address         	-  	213, Agaraharam St., Kanthamangalam,
+Komal-609805, TamilNadu.
+
+DECLARATION:
+
+	I hereby declare that the above information provided is true up to my knowledge.
+
+Place:											[Signature]
+
+Date:											S. Ashok
